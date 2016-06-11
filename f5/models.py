@@ -48,7 +48,7 @@ Examples:
 
 	- Update values using square bracket attribute syntax.
 		```
-		foo['bar_name'] = 'Eastern Bloc'
+		foo['bar_name'] = 'Industry'
 		foo.dirty
 		# -> set(['bar_name'])
 		```
@@ -70,9 +70,7 @@ class Model(object):
 		if fields is None:
 			fields = {}
 
-		self.fields = {k: None for k in self.columns}
-
-		self.fields.update((k, fields[k]) for k in fields if k in self.columns)
+		self.fields = {k: fields.get(k, None) for k in self.columns}
 		self.dirty = set()
 
 	def __getitem__(self, key):
