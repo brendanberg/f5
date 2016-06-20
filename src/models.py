@@ -54,12 +54,8 @@ Examples:
 		```
 '''
 
+from functools import wraps
 
-class Model(object):
-	''' Model instances are either returned populated from service classes or
-		are created by the application and then saved by the service. The model
-		maintains a set of fields that have been modified so that updating an
-		object in the data store only modifies the changed fields.'''
 
 	columns = ['id']
 	table_name = None
