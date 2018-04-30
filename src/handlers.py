@@ -25,16 +25,18 @@ Make request handlers more useful
 
 import re
 import json
+from json.decoder import JSONDecodeError
 import decimal
 import logging
 import functools
+
 
 try:
     from urllib import parse
 except ImportError:
     import urlparse as parse
 
-from tornado.web import RequestHandler, HTTPError
+from tornado.web import RequestHandler, HTTPError, MissingArgumentError
 from core.encoding import ModelJSONEncoder
 from core.dispatch import multimethod
 
@@ -51,6 +53,7 @@ def cross_origin(wrapped):
         origin = self.request.headers.get('Origin', None)
 
         if not origin:
+            logging.info('[Cross-Origin] no origin header supplied')
             return wrapped(self, *args, **kwargs)
 
         pattern = getattr(self, '_origin_pattern', None)
@@ -94,7 +97,7 @@ def cross_origin(wrapped):
                 'Authorization', 'If-Modified-Since', 'Cookie', 'X-Xsrftoken',
                 'Etag']))
             self.set_header('Access-Control-Expose-Headers', (
-                'Content-Disposition,Location'))
+                'Content-Disposition,Location,Set-Cookie'))
 
         return wrapped(self, *args, **kwargs)
     return wrapper
@@ -150,7 +153,8 @@ class BaseRequestHandler(RequestHandler):
             logging.info(self.request.utf_query_arguments)
 
         self.environment = config['tornado'].get('environment', 'development')
-        self.services = kwargs.get('services', {})
+        self.object_store = kwargs.get('object_store', None)
+        self.kv_store = kwargs.get('kv_store', None)
 
         if hasattr(self, 'initialize_delegate'):
             # pylint: disable=no-member
@@ -169,8 +173,42 @@ class BaseRequestHandler(RequestHandler):
             'application/json'
         ]
         if str(content_type).lower() in allowed_types and self.request.body:
-            self.json_body = json.loads(self.request.body.decode('utf-8'),
-                                        parse_float=decimal.Decimal)
+            # I added the test for a `request.body` because the proxy was
+            # sending a `Content-Type` header on GET requests (because the
+            # Lua Nginx module uses the same context for subrequests as the
+            # main request.)
+            try:
+                self.json_body = json.loads(self.request.body.decode('utf-8'),
+                                            parse_float=decimal.Decimal)
+            except JSONDecodeError as e:
+                self.set_status(400)
+                self.write({
+                    'error': 'JSONDecodeError',
+                    'message': e.msg
+                })
+                self.finish()
+                return
+        else:
+            self.json_body = {}
+
+    _ARG_DEFAULT = []
+
+    def get_json_argument(self, name, default=_ARG_DEFAULT):
+        '''
+        Return the value for a given key in a JSON request body.
+
+        If no `default` parameter is supplied by the caller, the argument
+        is presumed to be required, and a `MissingArgumentError` is raised
+        if the argument is missing.
+        '''
+        value = self.json_body.get(name)
+
+        if not value:
+            if default is self._ARG_DEFAULT:
+                raise MissingArgumentError(name)
+            return default
+
+        return value
 
     def build_url(self, path, params=None, query=None):
         '''
@@ -272,17 +310,19 @@ class JSONRequestHandler(BaseRequestHandler):
         "Override Tornado's default etag support"
         return None
 
-    def write_json(self, obj, sort_keys=True):
+    def write_json(self, obj, mimetype=ARG_DEFAULT):
         "Writes the JSON-stringified value of obj to the response stream"
 
         if self._jsonp_callback:
             self.set_header('Content-Type', 'application/javascript')
+        elif mimetype is not ARG_DEFAULT:
+            self.set_header('Content-Type', mimetype)
         else:
             self.set_header('Content-Type', 'application/json; charset=UTF-8')
 
         # TODO: Cache management using Etag and If-None-Match headers
 
-        response = json.dumps(obj, cls=ModelJSONEncoder, sort_keys=sort_keys)
+        response = json.dumps(obj, cls=ModelJSONEncoder)
 
         if self._jsonp_callback:
             response = '/*_*/{0}({1});'.format(self._jsonp_callback, response)

@@ -52,133 +52,104 @@ def build_select_expression(columns, transform, alias=None):
         alias = alias + '.'
 
     def transform_col(column):
+        '''
+        Return the transformed name for the specified column
+        '''
         return transform.get(column, '{{0}}{0}'.format(column))
 
     return ', '.join(transform_col(col) for col in columns).format(alias)
 
 
-def decode_filter_exp(expr):
-    def sanitize(v):
-        val = v.replace('%', r'\%').replace('_', r'\_')
-        return re.sub(r'[ -]', '_', re.sub(r'[!,.\'#]', '', val))
-
-    op, val = expr
-    op = op.lower()
-
-    decoded = ({
-        ('is', None): ('IS', None),
-        ('is not', None): ('IS NOT', None),
-        ('is', True): ('!=', 0),
-        ('is', False): ('=', 0),
-        ('is not', True): ('=', 0),
-        ('is not', False): ('!=', 0)
-    }).get((op, val))
-
-    if decoded:
-        return decoded
-
-    if isinstance(val, str):
-        sanitized_val = sanitize(val)
-
-        if sanitized_val[0] == '^' and sanitized_val[-1] == '$':
-            return ('LIKE', sanitized_val[1:-1])
-        elif sanitized_val[0] == '^':
-            return ('LIKE', '{0}%'.format(sanitized_val[1:]))
-        elif sanitized_val[-1] == '$':
-            return ('LIKE', '%{0}'.format(sanitized_val[:-1]))
-        else:
-            return ('LIKE', '%{0}%'.format(sanitized_val))
-    elif isinstance(val, tuple):
-        return (op, [sanitize(v) if isinstance(v, str) else v for v in val])
-    else:
-        return (op, val)
-
-
-class Service(object):
+class ObjectStore(object):
     '''
-    Service instances maintain a reference to a datastore connection pool
-    and provide an interface to query, create, update, and delete models.
+    An ObjectStore instance maintains a reference to a datastore connection
+    pool and provides an interface to query, create, update, and delete models.
     '''
-
-    model_class = Model
-
     dispatch = classmethod(multimethod)
 
-    def __init__(self, datastores):
-        self.buffer = {}
-        self.datastores = datastores
+    def __init__(self, datastores, mysql_write=None, redis=None):
+        if isinstance(datastores, dict):
+            self.datastores = datastores
+        else:
+            self.datastores = {
+                'mysql_read': datastores,
+                'mysql_write': mysql_write,
+                'redis': redis
+            }
+        self.buffer = []
+        self.update_buffer = []
         self._identifier_pattern = None
         self.MAX_BUFFER_SIZE = 1000  # can tweak this constant
 
     def match_identifier(self, identifier):
-        '''
-        Returns the identifier string if it is a valid MySQL table or
-        column name. Use this as a precaution to prevent SQL injection via
-        identifier names in queries.
+        ''' Returns the identifier string if it is a valid MySQL table or
+            column name. Use this as a precaution to prevent SQL injection via
+            identifier names in queries.
 
-        (This is insanity is necessary because the %s format option in the
-        Python MySQL bindings only escapes Python data types being used as
-        column values.)
-        '''
+            (This is insanity is necessary because the %s format option in the
+            Python MySQL bindings only escapes Python data types being used as
+            column values.)'''
         if self._identifier_pattern is None:
             self._identifier_pattern = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
         match = self._identifier_pattern.match(identifier)
         return match and match.group()
 
-    def count(self):
+    def count(self, result_class):
         '''
         Return the count of all models of the service's type in the data store
         '''
-        query = 'SELECT COUNT(id) FROM {0} WHERE {1}'.format(
-            self.model_class.table_name,
-            'date_deleted IS NULL' if 'date_deleted' in self.model_class.columns else '1')
+        count_fmt = 'SELECT COUNT(id) AS count FROM `{0}`'
+
+        if 'date_deleted' in result_class.columns:
+            count_fmt = count_fmt + ' WHERE date_deleted IS NULL'
+
+        query = count_fmt.format(result_class.table_name)
 
         with self.datastores['mysql_read'] as (unused_conn, cursor):
             cursor.execute(query)
             result = cursor.fetchone()
 
         if result:
-            return result['COUNT(id)']
+            return result['count']
         else:
             return None
 
-    def retrieve_by_id(self, item_id, use_cache=True):
-        "Return a model populated by the database object identified by item_id"
-        return self.retrieve_by_prop(item_id, 'ID', use_cache)
+    def model_with_id(self, result_class, item_id, use_cache=True):
+        '''
+        Return a model populated by the database object identified by item_id
+        '''
+        retrieve_fmt = 'SELECT {columns} FROM `{table}` WHERE ID = %s {filter} LIMIT 1'
+        filter_clause = ''
 
-    def retrieve_by_prop(self, prop, prop_name, use_cache=True):
-        "Return a model populated by the database object identified by prop_name"
-        columns = self.model_class.columns
-        transform = self.model_class.select_transform
+        if 'date_deleted' in result_class.columns:
+            filter_clause = 'AND date_deleted IS NULL'
+        else:
+            filter_clause = ''
 
-        retrieve_stmt = '''SELECT {columns} FROM {table_name} WHERE {prop_name} = %s
-            {deleted} LIMIT 1'''
+        columns = result_class.columns
+        transform = result_class.select_transform
 
-        deleted_clause = 'AND date_deleted IS NULL' if 'date_deleted' in self.model_class.columns else ''
-
-        query = retrieve_stmt.format(
-            prop_name=prop_name,
-            deleted=deleted_clause,
+        query = retrieve_fmt.format(
             columns=build_select_expression(columns, transform),
-            table_name=self.match_identifier(self.model_class.table_name)
+            table=self.match_identifier(result_class.table_name),
+            filter=filter_clause
         )
 
         if use_cache:
-            result = self.datastores['redis'].get_object(
-                self.model_class, prop)
+            result = self.datastores['redis'].get_object(result_class, item_id)
 
             if result:
                 # logging.error('Retrieved from cache')
                 return result
 
         with self.datastores['mysql_read'] as (unused_conn, cursor):
-            cursor.execute(query, (prop,))
+            cursor.execute(query, (item_id,))
             # logging.error(cursor.description)
             result = cursor.fetchone()
 
         if result:
-            model = self.model_class(result)
+            model = result_class(result)
 
             if use_cache:
                 self.datastores['redis'].set_object(model)
@@ -187,15 +158,59 @@ class Service(object):
         else:
             return None
 
-    def count_filtered(self, filters, dependencies={}, join_op='AND'):
+    def model_with_fields(self, result_class, use_cache=True, prevent_deleted=True, **kwargs):
+        '''
+        Return a model populated by the database object matching the
+        intersection of all specified field values
+        '''
+        retrieve_fmt = 'SELECT {columns} FROM {table} WHERE {whereclause} LIMIT 1'
+        expressions = []
+        values = []
+
+        for key, val in kwargs.items():
+            if val is None:
+                expressions.append('{0} IS NULL'.format(key))
+            else:
+                expressions.append('{0} = %s'.format(key))
+                values.append(val)
+
+        if prevent_deleted and 'date_deleted' in result_class.columns:
+            expressions.append('date_deleted IS NULL')
+
+        columns = result_class.columns
+        transform = result_class.select_transform
+
+        query = retrieve_fmt.format(
+            columns=build_select_expression(columns, transform),
+            table=self.match_identifier(result_class.table_name),
+            whereclause=' AND '.join(expressions)
+        )
+
+        # logging.info(query % tuple(values))
+        with self.datastores['mysql_read'] as (unused_conn, cursor):
+            cursor.execute(query, tuple(values))
+            result = cursor.fetchone()
+
+        if result:
+            model = result_class(result)
+
+            if use_cache:
+                self.datastores['redis'].set_object(model)
+
+            return model
+        else:
+            return None
+
+    def count_matching_filter(self, result_class, filters, dependencies={}):
         '''
         Return the total filtered item count
 
         (Convenience wrapper around `retrieve_filtered`)
         '''
-        return self.retrieve_filtered(filters, None, dependencies, count_only=True, join_op=join_op)
+        return self.models_matching_filter(result_class, filters, None, dependencies, count_only=True)
 
-    def retrieve_filtered(self, filters, bounds, dependencies={}, count_only=False, join_op='AND'):
+    def models_matching_filter(self, result_class, filters, bounds=None,
+                               dependencies={}, count_only=False, sort='id', direction='ASC'):
         '''
         Return a list of objects whose attributes match the filter parameters
 
@@ -204,63 +219,82 @@ class Service(object):
         '''
 
         def build_join_clause(dependencies, filters):
-            clause_fmt = 'LEFT JOIN {target} ON {dependency}.{ref} = {target}.id'
-            pending = [(filter[0], False) for filter in filters]
-            completed = set((self.model_class,))
+            '''
+            Return a MySQL join clause for filters applied on foreign fields
+
+            The join clause is constructed by iterating over the list of filters
+            and looking up any foreign key relationships defined in the
+            dependency dictionary.
+            '''
+            clause_fmt = 'JOIN {to_table} ON {from_table}.{ref} = {to_table}.id'
+            pending = [filter[0] for filter in filters]
+            completed = set()
             join_clauses = []
 
-            for target, seen in pending:
-                # As we iterate through the list of filters, we want to
-                # order the joins from closest to furthest from the origin
-                # table. In the case of a table T referencing a dependency
-                # D1, which in turn references the primary table P:
-                # (T)->(D)->(P), we want to make sure D is joined to P
-                # before T is joined to D.
+            for to_class in pending:
+                from_class = dependencies.get(to_class, None)
 
-                # We pull a pending filter from the list of filters and
-                # look up its dependency. If we've already satisfied the
-                # constraint, we skip it.
+                if from_class and from_class not in completed:
+                    if from_class != result_class:
+                        pending.append(from_class)
 
-                dependency = dependencies.get(target, None)
-                # With the dependency in hand, we test whether the target has
-                # been satisfied
+                    join_clauses.append(clause_fmt.format(
+                        to_table=to_class.table_name,
+                        from_table=from_class.table_name,
+                        ref=to_class.link_name
+                    ))
 
-                if dependency and target not in completed:
-                    if dependency in completed:
-                        # If the dependency is in the set of satisfied targets
-                        # (which includes the primary table), it's safe to
-                        # append the dependency. We also mark that the target
-                        # has been satisfied.
-                        join_clauses.append(clause_fmt.format(
-                            target=target.table_name,
-                            dependency=dependency.table_name,
-                            ref=target.link_name
-                        ))
+                    completed.add(from_class)
 
-                        completed.add(target)
-                    elif not seen:
-                        # If we haven't seen this target before, we append the
-                        # dependency to the pending list (marked 'unseen') and
-                        # we append the target (marked 'seen')
-                        pending.append((dependency, False))
-                        pending.append((target, True))
-                    else:
-                        # If the target has previously been seen, this is a
-                        # dependency that cannot be satisfied. That's an error
-                        raise Exception(
-                            'unsatisfiable filter dependency: %s -> %s', target, dependency)
+            return ' '.join(reversed(join_clauses))
 
-            return ' '.join(join_clauses)
+        def decode_filter_exp(expr):
+            '''
+            Return a MySQL operator and value for a parsed operator expression
+            '''
+            op, val = expr
+            op = op.lower()
 
-        columns = self.model_class.columns
-        transform = self.model_class.select_transform
+            decoded = ({
+                # Maps operator expression to MySQL filter clause expression
+                ('is', None): ('IS', None),
+                ('is not', None): ('IS NOT', None),
+                ('is', True): ('!=', 0),
+                ('is', False): ('=', 0),
+                ('is not', True): ('=', 0),
+                ('is not', False): ('!=', 0)
+            }).get((op, val))
+
+            if decoded:
+                return decoded
+
+            if isinstance(val, str) and op != '!=':
+                # Operator string expressions use the regexp ^ and $ characters
+                # to indicate start and end positions of the given match string.
+                # Here, we convert those values to use the % wildcard used in
+                # MySQL `LIKE` expressions.
+                sanitized_val = val.replace('%', r'\%').replace('_', r'\_')
+
+                if sanitized_val[0] == '^' and sanitized_val[-1] == '$':
+                    return ('LIKE', sanitized_val[1:-1])
+                elif sanitized_val[0] == '^':
+                    return ('LIKE', '{0}%'.format(sanitized_val[1:]))
+                elif sanitized_val[-1] == '$':
+                    return ('LIKE', '%{0}'.format(sanitized_val[:-1]))
+                else:
+                    return ('LIKE', '%{0}%'.format(sanitized_val))
+            else:
+                return (op, val)
+
+        columns = result_class.columns
+        transform = result_class.select_transform
 
         retrieve_stmt = '''
-            SELECT {columns} FROM {table_name} {join_clause}
+            SELECT {columns} FROM `{table_name}` {join_clause}
             WHERE {filter_clause}
         '''
 
-        if 'date_deleted' in self.model_class.columns:
+        if 'date_deleted' in result_class.columns:
             retrieve_stmt += 'AND {table_name}.date_deleted IS NULL '
 
         where_clauses = []
@@ -278,25 +312,18 @@ class Service(object):
 
             mysql_op, mysql_val = decode_filter_exp((op, val))
 
-            if isinstance(mysql_val, list):
-                where_clauses.append('{0}.{1} {2} ({3})'.format(
-                    cls.table_name, field, mysql_op, ', '.join(
-                        ['%s'] * len(mysql_val))
-                ))
-                values += mysql_val
-            else:
-                where_clauses.append('{0}.{1} {2} %s'.format(
-                    cls.table_name, field, mysql_op))
-                values.append(mysql_val)
+            where_clauses.append('{0}.{1} {2} %s'.format(
+                cls.table_name, field, mysql_op))
+            values.append(mysql_val)
 
         if count_only is True:
             cols = 'COUNT(*) AS count'
             vals = tuple(values)
         else:
             cols = build_select_expression(
-                columns, transform, alias=self.model_class.table_name)
+                columns, transform, alias=result_class.table_name)
             vals = tuple(values)
-            retrieve_stmt += 'ORDER BY {table_name}.id'
+            retrieve_stmt += 'ORDER BY {table_name}.{sort} {direction}'
 
             if bounds:
                 vals += bounds
@@ -304,9 +331,10 @@ class Service(object):
 
         query = retrieve_stmt.format(
             columns=cols,
-            table_name=self.match_identifier(self.model_class.table_name),
+            table_name=self.match_identifier(result_class.table_name),
             join_clause=build_join_clause(dependencies, filters),
-            filter_clause=' {} '.format(join_op).join(where_clauses)
+            filter_clause=' AND '.join(where_clauses),
+            sort=sort, direction=direction
         )
 
         # logging.info(query % vals)
@@ -321,35 +349,40 @@ class Service(object):
         if count_only is True:
             return results['count']
         else:
-            return [self.model_class(r) for r in results]
+            return [result_class(r) for r in results]
 
-    def retrieve_by_prop_list(self, prop_list, prop='id', use_cache=True):
-        "Return a list of objects specified by the list of IDs"
-        if not prop_list:
-            return []
+    def models_with_ids(self, result_class, id_list, use_cache=True):
+        '''
+        Return a list of objects specified by the list of IDs
+        '''
 
-        columns = self.model_class.columns
-        transform = self.model_class.select_transform
+        columns = result_class.columns
+        transform = result_class.select_transform
 
-        select_statement = '''SELECT {columnset} FROM {table_name}
-            WHERE {prop} IN ({subquery}) AND date_deleted IS NULL
-            ORDER BY FIELD({prop}, {subquery})'''
+        select_statement = '''SELECT {columnset} FROM `{table_name}`
+            WHERE id IN ({subquery}) {deleted_clause}
+            ORDER BY FIELD(id, {subquery})'''
+
+        if 'date_deleted' in result_class.columns:
+            deleted_clause = 'AND date_deleted IS NULL'
+        else:
+            deleted_clause = ''
 
         query = select_statement.format(
             columnset=build_select_expression(columns, transform),
-            table_name=self.match_identifier(self.model_class.table_name),
-            subquery=', '.join(['%s'] * len(prop_list)),
-            prop=prop
+            table_name=self.match_identifier(result_class.table_name),
+            subquery=', '.join(['%s'] * len(id_list)),
+            deleted_clause=deleted_clause
         )
 
         with self.datastores['mysql_read'] as (_, cursor):
-            cursor.execute(query, tuple(prop_list * 2))
+            cursor.execute(query, tuple(id_list * 2))
             results = cursor.fetchall()
 
         models = []
 
         for r in results:
-            model = self.model_class(r)
+            model = result_class(r)
 
             if use_cache:
                 self.datastores['redis'].set_object(model)
@@ -358,20 +391,19 @@ class Service(object):
 
         return models
 
-    def retrieve_by_id_list(self, id_list, use_cache=True):
-        "Return a list of objects specified by the list of IDs"
-        return self.retrieve_by_prop_list(id_list, prop='id', use_cache=use_cache)
-
-    def retrieve_all(self, bounds, sort='id', ascending=True, use_cache=True):
-        "Return all items from the database, restricted by bounds"
-        columns = self.model_class.columns
-        transform = self.model_class.select_transform
+    def models_in_range(self, result_class, bounds, sort='id', ascending=True, use_cache=True):
+        '''
+        Return all items from the database, restricted by bounds
+        '''
+        columns = result_class.columns
+        transform = result_class.select_transform
 
         limits = [bounds.limit, bounds.offset] if bounds else []
 
-        query = 'SELECT {columnset} FROM {table} {whereclause} ORDER BY {sort} {dir} {limit}'
+        query = '''SELECT {columnset} FROM `{table}` {whereclause}
+            ORDER BY {sort} {dir} {limit}'''
 
-        where_clause = 'WHERE date_deleted IS NULL' if 'date_deleted' in self.model_class.columns else ''
+        where_clause = 'WHERE date_deleted IS NULL' if 'date_deleted' in result_class.columns else ''
 
         direction_map = {
             True: 'ASC',
@@ -381,7 +413,7 @@ class Service(object):
         parameters = {
             'whereclause': where_clause,
             'columnset': build_select_expression(columns, transform),
-            'table': self.match_identifier(self.model_class.table_name) or '',
+            'table': self.match_identifier(result_class.table_name) or '',
             'sort': self.match_identifier(sort) or 'id',
             'dir': direction_map[ascending],
             'limit': 'LIMIT %s OFFSET %s' if bounds else ''
@@ -394,7 +426,7 @@ class Service(object):
         models = []
 
         for r in results:
-            model = self.model_class(r)
+            model = result_class(r)
 
             if use_cache:
                 self.datastores['redis'].set_object(model)
@@ -403,33 +435,49 @@ class Service(object):
 
         return models
 
-    def retrieve_for_model(self, model, set_attr=None):
+    def model_referenced_by_model(self, result_class, model, set_attr=None):
+        '''
+        Return a record of type specified by `result_class` that is referenced
+        by the `result_class.link_name` property defined in `model`. If
+        `set_attr` is supplied, the resulting list will be assigned to an
+        attribute on the model object with the given name.
+
+        Args:
+            result_class: the type of object to be returned
+            model: the model instance that is the target of the one-to-many
+                relationship
+            set_attr: (optional) if set, the attribute name to assign the
+                results to on the model instance
+
+        Returns:
+            the instance referenced by model
+        '''
         # The link ID is the `[THIS_TABLE]_id` column in the model
         # So product_service.retrieve_for_model(offering) would create a new
         # product object whose ID is specified as the `product_id` property
         # of the offering object.
-        link_id = model.get(self.model_class.link_name, None)
+        link_id = model.get(result_class.link_name, None)
 
         if not link_id:
             return None
 
-        columns = self.model_class.columns
-        transform = self.model_class.select_transform
+        columns = result_class.columns
+        transform = result_class.select_transform
 
-        query_fmt = '''SELECT {columnset} FROM {table} obj WHERE id = %s'''
+        query_fmt = '''SELECT {columnset} FROM `{table}` obj WHERE id = %s'''
         query = query_fmt.format(
             columnset=build_select_expression(columns, transform, alias='obj'),
             # ', '.join(transform.get(col, col) for col in columns)
-            table=self.match_identifier(self.model_class.table_name)
+            table=self.match_identifier(result_class.table_name)
         )
 
-        obj = self.datastores['redis'].get_object(self.model_class, link_id)
+        obj = self.datastores['redis'].get_object(result_class, link_id)
 
         if not obj:
             with self.datastores['mysql_read'] as (_, cursor):
                 cursor.execute(query, (link_id,))
                 r = cursor.fetchone()
-            obj = r and self.model_class(r)
+            obj = r and result_class(r)
 
             if obj:
                 self.datastores['redis'].set_object(obj)
@@ -439,9 +487,10 @@ class Service(object):
 
         return obj
 
-    def retrieve_all_for_model(self, model, bounds=None, sort='id', ascending=True, set_attr=None):
+    def models_referencing_model(self, result_class, model, bounds,
+                                 sort='id', ascending=True, set_attr=None):
         '''
-        Return a list of all records of the service's model type that refer to
+        Return a list of all records of the `result_class` type that refer to
         the given model in a one-to-many relationship. If `set_attr` is
         supplied, the resulting list will be assigned to an attribute on the
         model object with the given name.
@@ -457,10 +506,10 @@ class Service(object):
         '''
         limits = [bounds.limit, bounds.offset] if bounds else []
 
-        columns = self.model_class.columns
-        transform = self.model_class.select_transform
+        columns = result_class.columns
+        transform = result_class.select_transform
 
-        query_fmt = '''SELECT {columnset} FROM {table} obj WHERE {link} = %s
+        query_fmt = '''SELECT {columnset} FROM `{table}` obj WHERE {link} = %s
             ORDER BY {sort} {dir} {limit}'''
 
         direction_map = {
@@ -470,7 +519,7 @@ class Service(object):
 
         parameters = {
             'columnset': build_select_expression(columns, transform, alias='obj'),
-            'table': self.match_identifier(self.model_class.table_name) or '',
+            'table': self.match_identifier(result_class.table_name) or '',
             'link': self.match_identifier(model.link_name),
             'sort': self.match_identifier(sort) or 'id',
             'dir': direction_map[ascending],
@@ -482,7 +531,7 @@ class Service(object):
         with self.datastores['mysql_read'] as (_, cursor):
             cursor.execute(query, (model.id,) + tuple(limits))
             results = cursor.fetchall()
-        objs = [self.model_class(r) for r in results]
+        objs = [result_class(r) for r in results]
 
         for obj in objs:
             self.datastores['redis'].set_object(obj)
@@ -492,7 +541,7 @@ class Service(object):
 
         return objs
 
-    def retrieve_list_for_model(self, model):
+    def models_linked_to_model(self, result_class, model):
         '''Return all entries for the specified model's type
         Note that if the model's table name is not part of a linking table
         the query will fail and you will not go to space today
@@ -503,23 +552,23 @@ class Service(object):
         Returns:
             the list of instances that were retrieved
         '''
-        columns = self.model_class.columns
-        transform = self.model_class.select_transform
+        columns = result_class.columns
+        transform = result_class.select_transform
 
         # NOTE: This is
         linking_table_name = "{0}_{1}".format(
-            model.table_name, self.model_class.table_name)
+            model.table_name, result_class.table_name)
 
-        query_fmt = '''SELECT {columnset} FROM {table} tbl_name
-            LEFT JOIN {link_table} link ON tbl_name.id = link.{self_link_name}
+        query_fmt = '''SELECT {columnset} FROM `{table}` tbl_name
+            JOIN {link_table} link ON tbl_name.id = link.{self_link_name}
             WHERE link.{other_link_name} = %s'''
 
         query = query_fmt.format(
             columnset=build_select_expression(
                 columns, transform, alias='tbl_name'),
-            table=self.match_identifier(self.model_class.table_name),
+            table=self.match_identifier(result_class.table_name),
             link_table=self.match_identifier(linking_table_name),
-            self_link_name=self.match_identifier(self.model_class.link_name),
+            self_link_name=self.match_identifier(result_class.link_name),
             other_link_name=self.match_identifier(model.link_name)
         )
 
@@ -530,12 +579,13 @@ class Service(object):
         models = []
 
         for r in results:
-            model = self.model_class(r)
+            model = result_class(r)
             self.datastores['redis'].set_object(model)
             models.append(model)
 
         return models
 
+    # TODO: This and model_has_assoc_item need to be renamed.
     def model_assoc_items(self, base_model, items, **extra):
         '''
         Create a record in a linking table for the pair of models
@@ -579,7 +629,7 @@ class Service(object):
         Returns true if a record exists in a linking table for the pair of
         records.
         '''
-        statement = '''SELECT id FROM {from_name}_{to_name}
+        statement = '''SELECT id FROM `{from_name}_{to_name}`
                 WHERE {from_link_name} = %s AND {to_link_name} = %s'''
 
         query = statemnt.format(
@@ -596,7 +646,7 @@ class Service(object):
         '''
         Delete a record in a linking table for the pair of models
         '''
-        statement = '''DELETE FROM {from_name}_{to_name}
+        statement = '''DELETE FROM `{from_name}_{to_name}`
                 WHERE {from_link_name} = %s AND {to_link_name} = %s'''
 
         query = statement.format(
@@ -607,31 +657,50 @@ class Service(object):
             cursor.execute(query, (model.id, item.id))
             conn.commit()
 
+    def write_custom(self, qry, vals=None):
+        # write a custom sql qry to the write database - ugly hack
+        with self.datastores['mysql_write'] as (conn, cursor):
+            cursor.execute(qry, vals)
+            conn.commit()
+
     def create(self, model):
-        "Save a new object by inserting it into the database"
+        '''
+        Save a new object by inserting it into the database
+        '''
         data = model.fields  # transform('mysql_insert_transform')
-        keys = data.keys()
+        modified = model.modified_dict
+        keys = modified.keys()
 
-        query = 'INSERT INTO {table} ({key_clause}) VALUES ({value_clause})'
-
+        query = 'INSERT INTO `{table}` ({key_clause}) VALUES ({value_clause})'
+        table_name = self.match_identifier(model.table_name) or ''
         parameters = {
-            'table': self.match_identifier(model.table_name) or '',
+            'table': table_name,
             'key_clause': ', '.join(self.match_identifier(x) for x in keys),
             'value_clause': ', '.join(['%s'] * len(keys))
         }
+
+        select_stmt = '''SELECT * FROM `{table}` WHERE id = %s
+            {filter} LIMIT 1'''
+        filter_str = 'AND date_deleted IS NULL' if 'date_deleted' in model.columns else ''
 
         with self.datastores['mysql_write'] as (conn, cursor):
             cursor.execute(query.format(**parameters),
                            tuple(data[k] for k in keys))
             conn.commit()
             model.id = cursor.lastrowid
+            cursor.execute(select_stmt.format(
+                table=table_name, filter=filter_str), (model.id,))
+            result = cursor.fetchone()
 
+        model.update(result)
         model.dirty = set()
         self.datastores['redis'].set_hash(model)
         self.datastores['redis'].set_object(model)
 
     def update(self, model, set_date_modified=True, refresh=False):
-        "Update an existing object in the database"
+        '''
+        Update an existing object in the database
+        '''
         if len(model.dirty) == 0:
             return
 
@@ -643,11 +712,10 @@ class Service(object):
 
         atom = '{} = %s'
         set_clause = ', '.join([atom] * len(keys)).format(*keys)
-
-        update_stmt = 'UPDATE {0} SET {1} WHERE id = %s'.format(
+        update_stmt = 'UPDATE `{0}` SET {1} WHERE id = %s'.format(
             self.match_identifier(model.table_name), set_clause)
         vals = list(modified.values()) + [model.id]
-        retrieve_stmt = '''SELECT * FROM {0} WHERE id = %s
+        retrieve_stmt = '''SELECT * FROM `{0}` WHERE id = %s
             AND date_deleted IS NULL LIMIT 1'''.format(model.table_name)
 
         with self.datastores['mysql_write'] as (conn, cursor):
@@ -675,7 +743,7 @@ class Service(object):
             model['date_deleted'] = datetime.now()
             self.update(model)
         else:
-            delete_stmt = 'DELETE FROM {0} WHERE id = %s'.format(
+            delete_stmt = 'DELETE FROM `{0}` WHERE id = %s'.format(
                 model.table_name)
 
             with self.datastores['mysql_write'] as (conn, cursor):
@@ -686,32 +754,10 @@ class Service(object):
         self.datastores['redis'].delete_hash(model)
         self.datastores['redis'].delete_object(model)
 
-    def delete_all(self, models, date_deleted=False):
-        '''
-        Delete the list of models by marking them deleted or deleting the rows
-        '''
-        if date_deleted:
-            for model in models:
-                self.delete(model)
-        else:
-            delete_stmt = 'DELETE FROM {table_name} WHERE id IN ({subquery})'
-            delete_stmt = delete_stmt.format(
-                table_name=self.match_identifier(self.model_class.table_name),
-                subquery=', '.join(['%s'] * len(models))
-            )
-            id_list = [model.id for model in models]
-
-            with self.datastores['mysql_write'] as (conn, cursor):
-                cursor.execute(delete_stmt, tuple(id_list))
-                conn.commit()
-
-            for model in models:
-                model.id = None
-                self.datastores['redis'].delete_hash(model)
-                self.datastores['redis'].delete_object(model)
-
     def populate(self, model):
-        "Abstract method (no-op) to populate the model with additional data"
+        '''
+        Abstract method (no-op) to populate the model with additional data
+        '''
         # pylint: disable=no-self-use
         return model
 
@@ -723,59 +769,53 @@ class Service(object):
         data = model.fields
         keys = data.keys()
 
-        query = 'INSERT INTO {table} ({key_clause}) VALUES ({value_clause})'
-        parameters = {
-            'table': self.match_identifier(model.table_name) or '',
-            'key_clause': ', '.join(self.match_identifier(x) for x in keys),
-            'value_clause': ', '.join(['%s'] * len(keys))
-        }
-        query = query.format(**parameters)
+        self.buffer.append(tuple(data[k] for k in keys))
 
-        if query in self.buffer:
-            self.buffer[query].append(tuple(data[k] for k in keys))
-        else:
-            self.buffer[query] = [tuple(data[k] for k in keys)]
-
-        if len(self.buffer[query]) == self.MAX_BUFFER_SIZE:
-            self.flush()
+        if len(self.buffer) == self.MAX_BUFFER_SIZE:
+            self.flush('create', model)
 
     def batch_update(self, model):
         "Updates multiple entries at once"
         data = model.fields
         keys = data.keys()
 
-        query = '''
-            INSERT INTO {table} ({key_clause}) VALUES ({value_clause})
-            ON DUPLICATE KEY UPDATE {update_clause}
-        '''
+        self.update_buffer.append(tuple(data[k] for k in keys))
+
+        if len(self.update_buffer) == self.MAX_BUFFER_SIZE:
+            self.flush('update', model)
+
+    def flush(self, operation, model):
+        "Write everything in the buffer to the database"
+        keys = model.fields.keys()
+
         parameters = {
             'table': self.match_identifier(model.table_name) or '',
             'key_clause': ', '.join(self.match_identifier(x) for x in keys),
-            'value_clause': ', '.join(['%s'] * len(keys)),
-            'update_clause': ', '.join('{col}=VALUES({col})'.format(col=self.match_identifier(x)) for x in keys)
+            'value_clause': ', '.join(['%s'] * len(keys))
         }
 
-        query = query.format(**parameters)
+        if operation == 'create':
+            query = 'INSERT INTO {table} ({key_clause}) VALUES ({value_clause})'
 
-        if query in self.buffer:
-            self.buffer[query].append(tuple(data[k] for k in keys))
-        else:
-            self.buffer[query] = [tuple(data[k] for k in keys)]
-
-        if len(self.buffer[query]) == self.MAX_BUFFER_SIZE:
-            self.flush()
-
-    def flush(self):
-        "Write everything in the buffer to the database"
-        with self.datastores['mysql_write'] as (conn, cursor):
-            for query in self.buffer:
-                try:
-                    cursor.executemany(query, self.buffer[query])
-                except Exception as e:
-                    conn.rollback()
-                    self.buffer = {}
-                    raise e
-                else:
+            if len(self.buffer) > 0:
+                with self.datastores['mysql_write'] as (conn, cursor):
+                    cursor.executemany(query.format(**parameters), self.buffer)
                     conn.commit()
 
-        self.buffer = {}
+            self.buffer = []
+        elif operation == 'update':
+            query = '''INSERT INTO {table} ({key_clause}) VALUES ({value_clause})
+            ON DUPLICATE KEY UPDATE {update_clause}'''
+
+            key = self.match_identifier
+
+            parameters['update_clause'] = ', '.join(
+                '{col}=VALUES({col})'.format(col=key(x)) for x in keys)
+
+            if len(self.update_buffer) > 0:
+                with self.datastores['mysql_write'] as (conn, cursor):
+                    cursor.executemany(query.format(
+                        **parameters), self.update_buffer)
+                    conn.commit()
+
+            self.update_buffer = []

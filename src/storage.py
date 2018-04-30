@@ -27,10 +27,11 @@ pools and a Redis context manager.
 '''
 # pylint: disable=star-args,abstract-class-not-used
 
-from tornado.web import HTTPError
+import os
 import redis
 from redis.exceptions import WatchError
 import pymysql as MySQLdb
+from tornado.web import HTTPError
 from core.encoding import MessagePackEncoder
 
 # import json
@@ -71,9 +72,9 @@ class Database(object):
     '''
     # pylint: disable=too-few-public-methods
 
-    def __init__(self, **settings):
-        self._debug = bool(settings.pop('debug', False))
-        self._mode = settings.pop('mode', 'read')
+    def __init__(self, *args, **kwargs):
+        self._debug = bool(kwargs.pop('debug', False))
+        self._mode = kwargs.pop('mode', 'read')
 
         config = dict(settings)
         if 'read' in config:
@@ -87,7 +88,6 @@ class Database(object):
             config.update(settings.get('read', {}))
 
         self._settings = config
-        # dict(settings, **settings.get(self._mode, {}))
         self._conn = None
         self._cursor = None
 
@@ -122,9 +122,11 @@ class Redis(object):
 
     DEFAULT_TTL = 3600
 
-    def __init__(self, **settings):
-        self._debug = bool(settings.pop('debug', False))
-        self._settings = dict(settings)
+    def __init__(self, *args, **settings):
+        self._settings = {
+            'host': settings.get('host'), 'port': settings.get('port'),
+            'db': settings.get('REDIS_DB_NOTIFY')
+        }
         self._conn = None
         self._pool = redis.ConnectionPool(**self._settings)
         self.encoder = MessagePackEncoder()
@@ -225,7 +227,7 @@ class Redis(object):
                         pipe.execute()
 
                         break
-                    except WatchError:
+                    except redis.WatchError:
                         continue
 
     def delete_hash(self, model):
