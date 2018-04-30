@@ -1,10 +1,24 @@
-# ==============================================================================
-# Web Core
-#
-# Data model base class
-# ------------------------------------------------------------------------------
 # Written by Brendan Berg
-# Copyright 2015, Brendan Berg
+# Copyright (c) 2015 The Electric Eye Company and Brendan Berg
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
 
 ''' WebCore model base class
 
@@ -22,107 +36,30 @@ a service class, which builds queries from the structure defined in the model
 class.
 
 Examples:
-	- Instantiating a model is done by passing a dictionary to the __init__
-		method. This populates the fields dictionary with the contents of the
-		supplied dictionary while ignoring field names that are not defined
-		database columns.
+    - Instantiating a model is done by passing a dictionary to the __init__
+        method. This populates the fields dictionary with the contents of the
+        supplied dictionary while ignoring field names that are not defined
+        database columns.
 
-		```
-		result = cursor.fetchone()
-		foo = FooModel(result)
-		```
+        ```
+        result = cursor.fetchone()
+        foo = FooModel(result)
+        ```
 
-	- Update values using square bracket attribute syntax.
-		```
-		foo['bar_name'] = 'Eastern Bloc'
-		foo.dirty
-		# -> set(['bar_name'])
-		```
+    - Update values using square bracket attribute syntax.
+        ```
+        foo['bar_name'] = 'Eastern Bloc'
+        foo.dirty
+        # -> set(['bar_name'])
+        ```
 '''
-
-from functools import wraps
-
-
-def implicitinit(cls):
-    '''
-    Decorator function to automatically call superclasses' __init__ methods
-    prior to calling the class's defined __init__.
-
-    Creates a reference to the class's defined __init__ method and replaces
-    that method with a new method that calls __init__ on each of the base
-    classes, then calls the original method if it was defined.
-    '''
-    # TODO: What happens if you wrap a subclass of a wrapped class?
-    # Do __init__ methods get called twice?
-    classinit = getattr(cls, '__init__', None)
-
-    def __init__(self, *args, **kwargs):
-        for base in cls.__bases__:
-            init = getattr(base, '__init__', None)
-            if init:
-                init(self, *args, **kwargs)
-        if classinit:
-            classinit(self, *args, **kwargs)
-
-    setattr(cls, '__init__', __init__)
-    return cls
-
-
-class Transform(object):
-
-    def __init__(self, xform):
-        self.transform = xform
-
-    def __get__(self, obj, type=None):
-        return self.transform_dict(obj.fields, self.transform(obj))
-
-    @staticmethod
-    def transform_dict(input, transform):
-        '''
-        Return a tranformed version of the input dictionary.
-
-        Parameters:
-                input: a dictionary with keys of type `str`
-                transform: a dictionary mapping `str` to `str` or `lambda`
-
-        Returns: a new dictionary with the transform applied.
-        '''
-        output = {}
-
-        # The `cache_transform` property of the model object either renames
-        # a key, deletes it, or transforms the value depending on whether we
-        # get a lambda, a string, or None
-
-        for k, v in input.items():
-            val_xform = transform.get(k, k)
-            if isinstance(val_xform, str):
-                output[val_xform] = v
-            elif isinstance(val_xform, Callable):
-                args = inspect.getargspec(l).args
-                if len(args) == 2:
-                    key, val = val_xform(k, v)
-                    output[key] = val
-                elif len(args) == 1:
-                    output[k] = val_xform(v)
-                elif len(args) == 0:
-                    output[k] = val_xform()
-
-        # TODO: This is kind of a hack, but we need a way to add keys
-        # specified in the transform dict that aren't named columns
-
-        new_keys = set(transform.keys()) - set(input.keys())
-
-        for k in new_keys:
-            val_xform = transform.get(k)
-
-            if isinstance(val_xform, Callable):
-                output[k] = val_xform()
-
-        return output
-
-
-def transform(fn):
-    return Transform(fn)
+from collections import Callable, defaultdict
+from hashlib import sha1
+import base64
+import json
+# import inspect
+import logging
+from core.encoding import ModelJSONEncoder
 
 
 SENTINEL = []
@@ -145,9 +82,7 @@ class Model(object):
         if fields is None:
             fields = {}
 
-        self.fields = {k: None for k in self.columns}
-
-        self.fields.update((k, fields[k]) for k in fields if k in self.columns)
+        self.fields = {k: fields.get(k, None) for k in self.columns}
         self.dirty = set()
 
     def __getitem__(self, key):
@@ -212,6 +147,8 @@ class Model(object):
         Update values in fields with the supplied dictionary
         Marks all supplied field names as dirty.
         '''
+        if 'id' in field_dict:
+            del field_dict['id']
         sanitized_fields = {k: field_dict[k]
                             for k in field_dict if k in self.columns}
         self.fields.update(sanitized_fields)
@@ -222,7 +159,7 @@ class Model(object):
         '''
         True if fields have been modified since being marked clean
         '''
-        return len(self.dirty) == 0
+        return len(self.dirty) != 0
 
     @property
     def id(self):
@@ -239,21 +176,20 @@ class Model(object):
         self.fields['id'] = value
 
     @property
+    def hash(self):
+        if self.is_dirty:
+            raise ValueError(
+                'Cannot generate hash on object with unsaved values')
+
+        # TODO: Should we use MessagePack here?
+        # Need to make sure MessagePack maintains order of keys...
+        str = json.dumps(self.fields, cls=ModelJSONEncoder, sort_keys=True)
+        hash = sha1(str.encode('utf-8'))
+        return base64.b32encode(hash.digest())
+
+    @property
     def modified_dict(self):
         '''
         Return only fields that have been modified since last update
         '''
         return {k: self.fields[k] for k in self.dirty}
-
-    @transform
-    def default(self):
-        '''
-        Return a transformation dictionary specifying how to construct a repre-
-        sentation suitible for publicly visible use.
-        '''
-        # TODO: fix this to work with transform_dict
-        return {'id': self.id}
-
-    @transform
-    def cache(self):
-        return {'id': None}

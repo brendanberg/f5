@@ -1,12 +1,32 @@
 # Written by Brendan Berg
-# Copyright 2015, The Electric Eye Company
+# Copyright (c) 2015 The Electric Eye Company and Brendan Berg
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
 
 '''
 Make request handlers more useful
 '''
 
-from tornado.web import RequestHandler, HTTPError
-from core.encoding import ModelJSONEncoder
+import re
+import json
+import decimal
+import logging
 import functools
 
 try:
@@ -14,20 +34,15 @@ try:
 except ImportError:
     import urlparse as parse
 
-import logging
-import json
-import re
+from tornado.web import RequestHandler, HTTPError
+from core.encoding import ModelJSONEncoder
+from core.dispatch import multimethod
+
+ARG_DEFAULT = []
 
 
-def authenticated(unused_method):
-    '''
-    Decorator for verifying authentication on handlers
-    '''
+def authenticated(method):
     pass
-
-
-class OriginMixin(object):
-    ALLOWED_ORIGINS = []
 
 
 def cross_origin(wrapped):
@@ -36,11 +51,11 @@ def cross_origin(wrapped):
         origin = self.request.headers.get('Origin', None)
 
         if not origin:
-            return
+            return wrapped(self, *args, **kwargs)
 
         pattern = getattr(self, '_origin_pattern', None)
 
-        logging.info('[Cross-Origin] request origin: %s', origin)
+        logging.debug('[Cross-Origin] request origin: %s', origin)
 
         if not pattern:
             pattern = re.compile(r'https?://([^/]+)/?')
@@ -60,12 +75,12 @@ def cross_origin(wrapped):
                     break
 
             if not allowed_origin:
-                logging.info(
+                logging.debug(
                     '[Cross-Origin] Host %s is not allowed', host_origin)
                 self.set_status(405)
                 return
 
-            logging.info(
+            logging.debug(
                 '[Cross-Origin] Generating headers for host %s', host_origin)
 
             method_list = self.get_implemented_methods()
@@ -73,22 +88,25 @@ def cross_origin(wrapped):
             self.set_header('Access-Control-Allow-Origin', origin)
             self.set_header('Access-Control-Allow-Credentials', 'true')
             self.set_header('Access-Control-Allow-Methods',
-                            ', '.join(method_list))
-            self.set_header('Access-Control-Allow-Headers', (
-                'Origin, Content-Type, Accept, Accept-Encoding, ' +
-                'If-Modified-Since, Cookie, X-Xsrftoken, Etag'))
+                            ','.join(method_list))
+            self.set_header('Access-Control-Allow-Headers', ','.join([
+                'Origin', 'Content-Type', 'Accept', 'Accept-Encoding',
+                'Authorization', 'If-Modified-Since', 'Cookie', 'X-Xsrftoken',
+                'Etag']))
+            self.set_header('Access-Control-Expose-Headers', (
+                'Content-Disposition,Location'))
 
         return wrapped(self, *args, **kwargs)
     return wrapper
 
 
 class BaseRequestHandler(RequestHandler):
-    # pylint: disable=abstract-method,too-many-public-methods
     '''
     Adds initialization delegate to RequestHandler
     '''
+    # pylint: disable=abstract-method,too-many-public-methods
 
-    ALLOWED_ORIGINS = []
+    ALLOWED_ORIGINS = [r'.*']
 
     def get_implemented_methods(self):
         method_list = ['OPTIONS']
@@ -102,17 +120,16 @@ class BaseRequestHandler(RequestHandler):
             # N.B. We're relying on the SUPPORTED_METHODS property
             # defined in the tornado.web.RequestHandler class.
             override = getattr(self, method.lower())
-            baseImpl = getattr(BaseRequestHandler, method.lower())
+            base_impl = getattr(BaseRequestHandler, method.lower())
 
-            if override.__func__ is not baseImpl.__func__:
+            if override.__code__ is not base_impl.__code__:
                 method_list.append('{0}'.format(method))
 
         return method_list
 
     @cross_origin
-    def options(self):
+    def options(self, *args, **kwargs):
         self.set_header('Allow', ','.join(self.get_implemented_methods()))
-        # self.write(self.get_implemented_methods())
 
     def initialize(self, **kwargs):
         '''
@@ -120,9 +137,10 @@ class BaseRequestHandler(RequestHandler):
         self.initialize_delegate method if there is one
         '''
         arguments = parse.parse_qs(self.request.query)
-        self.request.utf_query_arguments = arguments
+
         # TODO: FIXME: This is a weird workaround to get scalar values out of
         # the arguments dictionary for use in the schematics validators
+        self.request.utf_query_arguments = arguments
         self.request.utf_query_argitems = {
             k: v[0] for k, v in arguments.items()
         }
@@ -132,7 +150,6 @@ class BaseRequestHandler(RequestHandler):
             logging.info(self.request.utf_query_arguments)
 
         self.environment = config['tornado'].get('environment', 'development')
-        self.data_service = kwargs.get('data_service')
         self.services = kwargs.get('services', {})
 
         if hasattr(self, 'initialize_delegate'):
@@ -145,31 +162,58 @@ class BaseRequestHandler(RequestHandler):
         Prepare the request
         '''
         content_type = self.request.headers.get('Content-Type')
-        json_types = [
-            'application/json; charset=utf-8',
-            'application/json',
-        ]
 
-        if content_type in json_types:
-            logging.info(self.request.body.decode('utf-8'))
-            self.json_body = json.loads(self.request.body.decode('utf-8'))
+        allowed_types = [
+            'application/json; charset=utf-8',
+            'application/json;charset=utf-8',
+            'application/json'
+        ]
+        if str(content_type).lower() in allowed_types and self.request.body:
+            self.json_body = json.loads(self.request.body.decode('utf-8'),
+                                        parse_float=decimal.Decimal)
+
+    def build_url(self, path, params=None, query=None):
+        '''
+        Format the URL
+        '''
+        if query is None:
+            query = {}
+
+        prefix = self.request.headers.get('X-Path-Prefix', '')
+
+        if isinstance(params, dict):
+            path = path.format(**params)
+        elif isinstance(params, list):
+            path = path.format(*params)
+
+        return parse.urlunparse((
+            self.request.protocol,
+            self.request.host,
+            '/'.join(x.strip('/') for x in [prefix, path]).strip('/'),
+            '',
+            '&'.join('{0}={1}'.format(key, val) for key, val in query.items()),
+            ''
+        ))
 
     def get_environment(self):
         return getattr(self, 'environment', 'development')
 
     def get_current_user(self):
         logging.info(
-            'attempt to authenticate in %s without an auth mixin in class lookup path',
+            'attempt to authenticate in %s without '
+            'an auth mixin in class lookup path',
             self.__class__.__name__
         )
         return None
 
+    dispatch = classmethod(multimethod)
+
 
 class HTMLRequestHandler(BaseRequestHandler):
-    # pylint: disable=abstract-method,too-many-public-methods
     '''
     Adds initialization delegate to RequestHandler
     '''
+    # pylint: disable=abstract-method,too-many-public-methods
     pass
 
 
@@ -186,7 +230,8 @@ class JSONRequestHandler(BaseRequestHandler):
 
     def _jsonp_callback_sanitize(self, callback_string):
         '''
-        Return callback_string if it is a valid JavaScript identifier
+        Return callback_string if the specified JSONP callback identifier is
+        valid JavaScript and not too long.
         '''
         if not self._jsonp_pattern:
             import re
@@ -219,10 +264,16 @@ class JSONRequestHandler(BaseRequestHandler):
         if self.application.configuration['tornado'].get('debug', False) == True:
             logging.info(self.request.utf_query_arguments)
 
-    def write_json(self, obj):
-        '''
-        Writes the JSON-stringified value of obj to the response stream
-        '''
+    def utf_get_argument(self, name, default=ARG_DEFAULT):
+        "retrieve utf-8 encoded argument"
+        raise NotImplementedError('this is goofy')
+
+    def compute_etag(self):
+        "Override Tornado's default etag support"
+        return None
+
+    def write_json(self, obj, sort_keys=True):
+        "Writes the JSON-stringified value of obj to the response stream"
 
         if self._jsonp_callback:
             self.set_header('Content-Type', 'application/javascript')
@@ -231,7 +282,7 @@ class JSONRequestHandler(BaseRequestHandler):
 
         # TODO: Cache management using Etag and If-None-Match headers
 
-        response = json.dumps(obj, cls=ModelJSONEncoder)
+        response = json.dumps(obj, cls=ModelJSONEncoder, sort_keys=sort_keys)
 
         if self._jsonp_callback:
             response = '/*_*/{0}({1});'.format(self._jsonp_callback, response)
