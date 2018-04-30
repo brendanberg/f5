@@ -149,7 +149,7 @@ class BaseRequestHandler(RequestHandler):
         }
 
         config = self.application.configuration
-        if config['tornado'].get('debug', False) == True:
+        if config['tornado'].get('debug', False) is True:
             logging.info(self.request.utf_query_arguments)
 
         self.environment = config['tornado'].get('environment', 'development')
@@ -299,7 +299,7 @@ class JSONRequestHandler(BaseRequestHandler):
 
             self._jsonp_callback = callback
 
-        if self.application.configuration['tornado'].get('debug', False) == True:
+        if self.application.configuration['tornado'].get('debug', False) is True:
             logging.info(self.request.utf_query_arguments)
 
     def utf_get_argument(self, name, default=ARG_DEFAULT):
