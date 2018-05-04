@@ -27,9 +27,11 @@ pools and a Redis context manager.
 '''
 # pylint: disable=star-args,abstract-class-not-used
 
-from tornado.web import HTTPError
+import os
 import redis
+from redis.exceptions import WatchError
 import pymysql as MySQLdb
+from tornado.web import HTTPError
 from f5.encoding import MessagePackEncoder
 
 # import json
@@ -40,9 +42,15 @@ from f5.encoding import MessagePackEncoder
 # Database Wrappers & Somesuch
 # -------------------------------------------------------------------
 
+# TODO: Look into SQL Alchemy and async DB connections:
+# https://blog.chartio.com/blog/making-mysql-queries-asynchronous-in-tornado
+
 class DatabaseConnectionError(HTTPError):
-    '''Tornado error class for database connection errors. There's got to be a
-    better way to do this'''
+    '''
+    Tornado error class for database connection errors. There's got to be a
+    better way to do this
+    '''
+
     def __init__(self, log_message=None, *args, **kwargs):
         HTTPError.__init__(self, log_message, *args, **kwargs)
 
@@ -56,14 +64,17 @@ class DatabaseConnectionError(HTTPError):
 
 
 class Database(object):
-    '''Database context manager. Instantiate with database connection
+    '''
+    Database context manager. Instantiate with database connection
     parameters, including debug mode and read xor write mode flag. Entering the
     context manager opens a connection and returns a tuple containing the
-    connection and cursor'''
+    connection and cursor
+    '''
     # pylint: disable=too-few-public-methods
-    def __init__(self, **settings):
-        self._debug = bool(settings.pop('debug', False))
-        self._mode = settings.pop('mode', 'read')
+
+    def __init__(self, *args, **kwargs):
+        self._debug = bool(kwargs.pop('debug', False))
+        self._mode = kwargs.pop('mode', 'read')
 
         config = dict(settings)
         if 'read' in config:
@@ -77,18 +88,20 @@ class Database(object):
             config.update(settings.get('read', {}))
 
         self._settings = config
-        # dict(settings, **settings.get(self._mode, {}))
         self._conn = None
         self._cursor = None
 
     def __enter__(self):
-        "Open a connection and return a tuple containing the connection and cursor"
+        '''
+        Open a connection and return a tuple containing the connection and cursor
+        '''
         self._conn = MySQLdb.connect(**self._settings)
 
         if self._mode == 'read':
             def not_implemented():
                 'lockout function for read connections'
-                raise NotImplementedError('Cannot write to a read-only connection')
+                raise NotImplementedError(
+                    'Cannot write to a read-only connection')
             self._conn.commit = not_implemented
             self._conn.rollback = not_implemented
 
@@ -106,9 +119,15 @@ class Redis(object):
     Redis context manager. Instantiate with redis server parameters.
     '''
     # pylint: disable=too-few-public-methods
-    def __init__(self, **settings):
-        self._debug = bool(settings.pop('debug', False))
-        self._settings = dict(settings)
+
+    DEFAULT_TTL = 3600
+
+    def __init__(self, *args, **settings):
+        self._settings = {
+            'host': settings.get('host'),
+            'port': settings.get('port'),
+            'db': settings.get('db')
+        }
         self._conn = None
         self._pool = redis.ConnectionPool(**self._settings)
         self.encoder = MessagePackEncoder()
@@ -122,7 +141,9 @@ class Redis(object):
         self._conn = None
 
     def build_key(self, namespace, id=None):
-        "Return the redis key for the specified namespace and id"
+        '''
+        Return the redis key for the specified namespace and id
+        '''
         if hasattr(namespace, 'table_name') and hasattr(namespace, 'id'):
             return '{0.table_name}:{0.id}'.format(namespace)
         elif id:
@@ -130,21 +151,45 @@ class Redis(object):
         else:
             return namespace
 
+    def set_raw_value(self, key, value):
+        '''
+        Set a raw bytes value for a key
+        '''
+        with self as redis:
+            redis.set(key.encode('utf-8'), value)
+            redis.expire(key.encode('utf-8'), self.DEFAULT_TTL)
+
+    def get_raw_value(self, key, default=None):
+        '''
+        Get a raw bytes value for a key
+        '''
+        with self as redis:
+            value = redis.get(key.encode('utf-8'))
+
+        try:
+            return value
+        except TypeError:
+            return default
+
     def set_value(self, key, value):
         '''
         Set a value for a key
         '''
         with self as redis:
             redis.set(key.encode('utf-8'), value.encode('utf-8'))
+            redis.expire(key.encode('utf-8'), self.DEFAULT_TTL)
 
-    def get_value(self, key):
+    def get_value(self, key, default=None):
         '''
         Get a value for a key
         '''
         with self as redis:
             value = redis.get(key.encode('utf-8'))
 
-        return str(value, encoding='utf-8')
+        try:
+            return str(value, encoding='utf-8')
+        except TypeError:
+            return default
 
     def delete_value(self, key):
         '''
@@ -171,12 +216,19 @@ class Redis(object):
                         pipe.multi()
                         if old_hash:
                             pipe.delete(old_hash)
+
+                        # When we set the hash values, we also set expiration
+                        # TTLs. The hash itself should expire before the hash
+                        # key ('{model}:{id}:hash') since we definitely don't
+                        # want it outlasting the hash key.
                         pipe.set(hash_key, model_hash)
+                        pipe.expire(hash_key, self.DEFAULT_TTL - 2)
                         pipe.set(model_hash, obj_key.encode('utf-8'))
+                        pipe.expire(model_hash, self.DEFAULT_TTL - 4)
                         pipe.execute()
-                        
+
                         break
-                    except WatchError:
+                    except redis.WatchError:
                         continue
 
     def delete_hash(self, model):
@@ -234,7 +286,7 @@ class Redis(object):
         # 'person:42:friends', ['person:12', 'person:92']
 
         key = self.build_key(model)
-        mapitems = dict(model.fields) #.items()
+        mapitems = dict(model.fields)  # .items()
         del mapitems['id']
 
         mapping = {
@@ -244,6 +296,7 @@ class Redis(object):
 
         with self as redis:
             response = redis.hmset(key, mapping)
+            redis.expire(key, self.DEFAULT_TTL)
 
         return response
 

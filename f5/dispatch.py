@@ -23,6 +23,9 @@
 Multiple dispatch implementation for rendering models based on output destination
 '''
 
+from enum import Enum
+
+
 def multimethod(cls, *types):
     '''
     Multiple dispatch decorator
@@ -54,12 +57,13 @@ class MultiMethod(object):
     method implementation to call
     '''
     # pylint: disable=too-few-public-methods
+
     def __init__(self, name):
         self.name = name
         self.typemap = {}
 
     def __get__(self, obj, owner=None):
-        def dispatch(model, mime_type, **kwargs):
+        def dispatch(model, specifier, **kwargs):
             '''
             Intercept the arguments to the multimethod call and select
             the appropriate implementation
@@ -68,15 +72,17 @@ class MultiMethod(object):
             # to generalize the dispatch rules, we could hook in here.
             # build_tuple(...) -> tuple
             # MultiMethod.lookup(tuple) -> function
-            types = (model.__class__, mime_type)
+            types = (model.__class__, specifier)
             function = self.typemap.get(types)
 
             if function is None:
-                raise TypeError(
-                        'no matching function implementation for (%s, %s)' %
-                        (model.__class__.__name__, mime_type.value))
+                name = None
 
-            return function(obj, model, mime_type, **kwargs)
+                raise TypeError(
+                    'no matching function implementation for (%s, %s)' %
+                    (model.__class__.__name__, specifier))
+
+            return function(obj, model, specifier, **kwargs)
 
         if obj is None:
             return self

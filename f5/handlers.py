@@ -25,20 +25,23 @@ Make request handlers more useful
 
 import re
 import json
+from json.decoder import JSONDecodeError
 import decimal
 import logging
 import functools
+
 
 try:
     from urllib import parse
 except ImportError:
     import urlparse as parse
 
-from tornado.web import RequestHandler, HTTPError
 from f5.encoding import ModelJSONEncoder
 from f5.dispatch import multimethod
+from tornado.web import RequestHandler, HTTPError, MissingArgumentError
 
 ARG_DEFAULT = []
+
 
 def authenticated(method):
     pass
@@ -50,6 +53,7 @@ def cross_origin(wrapped):
         origin = self.request.headers.get('Origin', None)
 
         if not origin:
+            logging.info('[Cross-Origin] no origin header supplied')
             return wrapped(self, *args, **kwargs)
 
         pattern = getattr(self, '_origin_pattern', None)
@@ -74,29 +78,35 @@ def cross_origin(wrapped):
                     break
 
             if not allowed_origin:
-                logging.debug('[Cross-Origin] Host %s is not allowed', host_origin)
+                logging.debug(
+                    '[Cross-Origin] Host %s is not allowed', host_origin)
                 self.set_status(405)
                 return
 
-
-            logging.debug('[Cross-Origin] Generating headers for host %s', host_origin)
+            logging.debug(
+                '[Cross-Origin] Generating headers for host %s', host_origin)
 
             method_list = self.get_implemented_methods()
 
             self.set_header('Access-Control-Allow-Origin', origin)
             self.set_header('Access-Control-Allow-Credentials', 'true')
-            self.set_header('Access-Control-Allow-Methods', ', '.join(method_list))
-            self.set_header('Access-Control-Allow-Headers', (
-                'Origin, Content-Type, Accept, Accept-Encoding, Authorization' +
-                'If-Modified-Since, Cookie, X-Xsrftoken, Etag'))
+            self.set_header('Access-Control-Allow-Methods',
+                            ','.join(method_list))
+            self.set_header('Access-Control-Allow-Headers', ','.join([
+                'Origin', 'Content-Type', 'Accept', 'Accept-Encoding',
+                'Authorization', 'If-Modified-Since', 'Cookie', 'X-Xsrftoken',
+                'Etag']))
             self.set_header('Access-Control-Expose-Headers', (
-                'Content-Disposition, Location'))
+                'Content-Disposition,Location,Set-Cookie'))
 
         return wrapped(self, *args, **kwargs)
     return wrapper
 
+
 class BaseRequestHandler(RequestHandler):
-    "Adds initialization delegate to RequestHandler"
+    '''
+    Adds initialization delegate to RequestHandler
+    '''
     # pylint: disable=abstract-method,too-many-public-methods
 
     ALLOWED_ORIGINS = [r'.*']
@@ -125,23 +135,26 @@ class BaseRequestHandler(RequestHandler):
         self.set_header('Allow', ','.join(self.get_implemented_methods()))
 
     def initialize(self, **kwargs):
-        '''Overrides RequestHandler.initialize and calls the
-        self.initialize_delegate method if there is one'''
+        '''
+        Overrides RequestHandler.initialize and calls the
+        self.initialize_delegate method if there is one
+        '''
         arguments = parse.parse_qs(self.request.query)
 
         # TODO: FIXME: This is a weird workaround to get scalar values out of
         # the arguments dictionary for use in the schematics validators
         self.request.utf_query_arguments = arguments
         self.request.utf_query_argitems = {
-                k: v[0] for k, v in arguments.items()
+            k: v[0] for k, v in arguments.items()
         }
 
         config = self.application.configuration
-        if config['tornado'].get('debug', False) == True:
+        if config['tornado'].get('debug', False) is True:
             logging.info(self.request.utf_query_arguments)
 
         self.environment = config['tornado'].get('environment', 'development')
-        self.services = kwargs.get('services', {})
+        self.object_store = kwargs.get('object_store', None)
+        self.kv_store = kwargs.get('kv_store', None)
 
         if hasattr(self, 'initialize_delegate'):
             # pylint: disable=no-member
@@ -149,7 +162,9 @@ class BaseRequestHandler(RequestHandler):
             self.initialize_delegate(**kwargs)
 
     def prepare(self):
-        "Prepare the request"
+        '''
+        Prepare the request
+        '''
         content_type = self.request.headers.get('Content-Type')
 
         allowed_types = [
@@ -158,8 +173,42 @@ class BaseRequestHandler(RequestHandler):
             'application/json'
         ]
         if str(content_type).lower() in allowed_types and self.request.body:
-            self.json_body = json.loads(self.request.body.decode('utf-8'),
-                parse_float=decimal.Decimal)
+            # I added the test for a `request.body` because the proxy was
+            # sending a `Content-Type` header on GET requests (because the
+            # Lua Nginx module uses the same context for subrequests as the
+            # main request.)
+            try:
+                self.json_body = json.loads(self.request.body.decode('utf-8'),
+                                            parse_float=decimal.Decimal)
+            except JSONDecodeError as e:
+                self.set_status(400)
+                self.write({
+                    'error': 'JSONDecodeError',
+                    'message': e.msg
+                })
+                self.finish()
+                return
+        else:
+            self.json_body = {}
+
+    _ARG_DEFAULT = []
+
+    def get_json_argument(self, name, default=_ARG_DEFAULT):
+        '''
+        Return the value for a given key in a JSON request body.
+
+        If no `default` parameter is supplied by the caller, the argument
+        is presumed to be required, and a `MissingArgumentError` is raised
+        if the argument is missing.
+        '''
+        value = self.json_body.get(name)
+
+        if not value:
+            if default is self._ARG_DEFAULT:
+                raise MissingArgumentError(name)
+            return default
+
+        return value
 
     def build_url(self, path, params=None, query=None):
         '''
@@ -199,13 +248,17 @@ class BaseRequestHandler(RequestHandler):
 
 
 class HTMLRequestHandler(BaseRequestHandler):
-    "Adds initialization delegate to RequestHandler"
+    '''
+    Adds initialization delegate to RequestHandler
+    '''
     # pylint: disable=abstract-method,too-many-public-methods
     pass
 
 
 class JSONRequestHandler(BaseRequestHandler):
-    "Adds methods for rendering JSON responses to the client"
+    '''
+    Adds methods for rendering JSON responses to the client
+    '''
     # pylint: disable=abstract-method,too-many-public-methods
 
     def __init__(self, *args, **kwargs):
@@ -246,7 +299,7 @@ class JSONRequestHandler(BaseRequestHandler):
 
             self._jsonp_callback = callback
 
-        if self.application.configuration['tornado'].get('debug', False) == True:
+        if self.application.configuration['tornado'].get('debug', False) is True:
             logging.info(self.request.utf_query_arguments)
 
     def utf_get_argument(self, name, default=ARG_DEFAULT):
@@ -257,17 +310,19 @@ class JSONRequestHandler(BaseRequestHandler):
         "Override Tornado's default etag support"
         return None
 
-    def write_json(self, obj):
+    def write_json(self, obj, mimetype=ARG_DEFAULT):
         "Writes the JSON-stringified value of obj to the response stream"
 
         if self._jsonp_callback:
             self.set_header('Content-Type', 'application/javascript')
+        elif mimetype is not ARG_DEFAULT:
+            self.set_header('Content-Type', mimetype)
         else:
             self.set_header('Content-Type', 'application/json; charset=UTF-8')
 
         # TODO: Cache management using Etag and If-None-Match headers
 
-        response = json.dumps(obj, cls=ModelJSONEncoder, sort_keys=True)
+        response = json.dumps(obj, cls=ModelJSONEncoder)
 
         if self._jsonp_callback:
             response = '/*_*/{0}({1});'.format(self._jsonp_callback, response)
