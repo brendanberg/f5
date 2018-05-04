@@ -252,6 +252,10 @@ class ObjectStore(object):
             '''
             Return a MySQL operator and value for a parsed operator expression
             '''
+            def sanitize(v):
+                val = v.replace('%', r'\%').replace('_', r'\_')
+                return re.sub(r'[ -]', '_', re.sub(r'[!,.\'#]', '', val))
+
             op, val = expr
             op = op.lower()
 
@@ -273,7 +277,7 @@ class ObjectStore(object):
                 # to indicate start and end positions of the given match string.
                 # Here, we convert those values to use the % wildcard used in
                 # MySQL `LIKE` expressions.
-                sanitized_val = val.replace('%', r'\%').replace('_', r'\_')
+                sanitized_val = sanitize(val)
 
                 if sanitized_val[0] == '^' and sanitized_val[-1] == '$':
                     return ('LIKE', sanitized_val[1:-1])
@@ -283,6 +287,8 @@ class ObjectStore(object):
                     return ('LIKE', '%{0}'.format(sanitized_val[:-1]))
                 else:
                     return ('LIKE', '%{0}%'.format(sanitized_val))
+            elif isinstance(val, tuple):
+                return (op, [sanitize(v) if isinstance(v, str) else v for v in val])
             else:
                 return (op, val)
 
@@ -312,9 +318,15 @@ class ObjectStore(object):
 
             mysql_op, mysql_val = decode_filter_exp((op, val))
 
-            where_clauses.append('{0}.{1} {2} %s'.format(
-                cls.table_name, field, mysql_op))
-            values.append(mysql_val)
+            if isinstance(mysql_val, list):
+                where_clauses.append('{0}.{1} {2} ({3})'.format(
+                    cls.table_name, field, mysql_op, ', '.join(['%s'] * len(mysql_val))
+                ))
+                values += mysql_val
+            else:
+                where_clauses.append('{0}.{1} {2} %s'.format(
+                    cls.table_name, field, mysql_op))
+                values.append(mysql_val)
 
         if count_only is True:
             cols = 'COUNT(*) AS count'

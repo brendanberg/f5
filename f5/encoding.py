@@ -149,7 +149,6 @@ class MessagePackEncoder(object):
             object_hook=self._object_decode
         )
         return msgpack.unpackb(str, **kwargs)
-=======
 
 def urlify(unused_handler, string):
     '''Return a string that has been munged to remove URL-unfriendly
@@ -165,4 +164,3 @@ def urlify(unused_handler, string):
     '''
     string = re.sub(r'[^A-Za-z0-9-/.]', '', re.sub(r' +', '-', string))
     return re.sub(r'[.,]([/-])', r'\1', string).lower()
->>>>>>> packaged-with-pypi:f5/template_methods.py
