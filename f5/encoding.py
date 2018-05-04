@@ -33,18 +33,14 @@ import msgpack
 
 
 class ModelJSONEncoder(JSONEncoder):
-    '''
-    Subclass of JSONEncoder that adds support for additional Python
-    datatypes used in model objects
-    '''
+    ''' Subclass of JSONEncoder that adds support for additional Python
+        datatypes used in model objects'''
 
     def default(self, obj):
         # pylint: disable=method-hidden
-        '''
-        Use the default behavior unless the object is a datetime object
-        (identified by the presence of the strftime attribute) or a model
-        object (identified by the presence of a public_dict attribute)
-        '''
+        ''' Use the default behavior unless the object is a datetime object
+            (identified by the presence of the strftime attribute) or a model
+            object (identified by the presence of a public_dict attribute)'''
 
         if isinstance(obj, Decimal):
             return '{0:f}'.format(obj)
@@ -69,10 +65,9 @@ class ModelJSONEncoder(JSONEncoder):
         else:
             return JSONEncoder.default(self, obj)
 
-
 class MessagePackEncoder(object):
     '''
-    Wrapper for MessagePack to build
+    Wrapper for MessagePack to build 
     '''
 
     def _object_encode(self, obj):
@@ -143,8 +138,8 @@ class MessagePackEncoder(object):
         an instance of the appropriate type.
         '''
         kwargs = dict(
-            encoding='utf-8',
-            use_list=False,
-            object_hook=self._object_decode
+                encoding='utf-8',
+                use_list=False,
+                object_hook=self._object_decode
         )
         return msgpack.unpackb(str, **kwargs)
