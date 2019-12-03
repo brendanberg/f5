@@ -26,7 +26,7 @@ Handles database querying, saving, updating, deleting, etc.
 '''
 # pylint: disable=star-args
 
-# from core.storage import Database
+# from f5.storage import Database
 from f5.models import Model
 from f5.dispatch import multimethod
 from datetime import datetime
