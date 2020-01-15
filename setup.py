@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 setup(
     name = "f5",
-    version = "0.0.3",
+    version = "0.0.4",
     packages = find_packages(),
     download_url='https://github.com/brendanberg/f5/archive/v0.0.2.tar.gz',
     # metadata for upload to PyPI
