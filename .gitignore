@@ -1,5 +1,9 @@
-.pyc
-.pyo
+*.py[cod]
+*.py.class
 __pycache__/
 build/
 .idea/
+dist/
+sdist/
+*.egg
+*.egg-info/
