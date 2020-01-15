@@ -11,6 +11,7 @@ setup(
     license = "MIT",
     install_requires = [
         'msgpack',
+        'tornado'
     ],
     keywords = "tornado orm rest api",
     url = "https://github.com/brendanberg/f5",
